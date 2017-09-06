@@ -27,6 +27,7 @@ import android.hardware.radio.V1_0.RadioError;
 import android.hardware.radio.V1_0.RadioIndicationType;
 import android.hardware.radio.V1_0.RadioResponseInfo;
 import android.hardware.radio.V1_0.RadioResponseType;
+import android.hardware.radio.V1_0.SelectUiccSub;
 import android.net.KeepalivePacketData;
 import android.net.LinkProperties;
 import android.os.AsyncResult;
@@ -194,6 +195,7 @@ public class RIL extends BaseCommands implements CommandsInterface {
     AtomicBoolean mTestingEmergencyCall = new AtomicBoolean(false);
 
     final Integer mPhoneId;
+    private List<String> mOldRilFeatures;
 
     private boolean mUseOldMncMccFormat;
 
@@ -1055,6 +1057,9 @@ public class RIL extends BaseCommands implements CommandsInterface {
 
         mUseOldMncMccFormat = SystemProperties.getBoolean(
                 "ro.telephony.use_old_mnc_mcc_format", false);
+
+        final String oldRilFeatures = SystemProperties.get("ro.telephony.ril.config", "");
+        mOldRilFeatures = Arrays.asList(oldRilFeatures.split(","));
 
         TelephonyManager tm = (TelephonyManager) context.getSystemService(
                 Context.TELEPHONY_SERVICE);
@@ -4059,21 +4064,26 @@ public class RIL extends BaseCommands implements CommandsInterface {
     }
 
     @Override
-    public void setUiccSubscription(int slotId, int appIndex, int subId, int subStatus,
-            Message result) {
-        RadioSimProxy simProxy = getRadioServiceProxy(RadioSimProxy.class, result);
-        if (!simProxy.isEmpty()) {
+    public void setUiccSubscription(int appIndex, boolean activate, Message result) {
+        IRadio radioProxy = getRadioProxy(result);
+        if (radioProxy != null) {
             RILRequest rr = obtainRequest(RIL_REQUEST_SET_UICC_SUBSCRIPTION, result,
                     mRILDefaultWorkSource);
 
             if (RILJ_LOGD) {
                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest)
-                        + " slot = " + slotId + " appIndex = " + appIndex
-                        + " subId = " + subId + " subStatus = " + subStatus);
+                        + " appIndex: " + appIndex + " activate: " + activate);
             }
 
+            SelectUiccSub info = new SelectUiccSub();
+            info.slot = mPhoneId;
+            info.appIndex = appIndex;
+
+            info.subType = mPhoneId;
+            info.actStatus = activate ? 1 : 0;
+
             try {
-                simProxy.setUiccSubscription(rr.mSerial, slotId, appIndex, subId, subStatus);
+                 radioProxy.setUiccSubscription(rr.mSerial, info);
             } catch (RemoteException | RuntimeException e) {
                 handleRadioProxyExceptionForRR(SIM_SERVICE, "setUiccSubscription", e);
             }
@@ -5942,5 +5952,9 @@ public class RIL extends BaseCommands implements CommandsInterface {
             default:
                 return "UNKNOWN:" + service;
         }
+    }
+
+    public boolean needsOldRilFeature(String feature) {
+        return mOldRilFeatures.contains(feature);
     }
 }
