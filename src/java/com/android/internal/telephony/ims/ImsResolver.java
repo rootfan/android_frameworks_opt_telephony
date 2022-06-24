@@ -75,6 +75,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import android.os.SystemProperties;
 
 /**
  * Creates a list of ImsServices that are available to bind to based on the Device configuration
@@ -417,6 +418,22 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
                 }
             };
 
+
+    private ImsServiceControllerFactory mImsServiceControllerFactoryStaticBindingCompat =
+            new ImsServiceControllerFactory() {
+                @Override
+                public String getServiceInterface() {
+                    // The static method of binding does not use service interfaces.
+                    return null;
+                }
+
+                @Override
+                public ImsServiceController create(Context context, ComponentName componentName,
+                        ImsServiceController.ImsServiceControllerCallbacks callbacks,ImsFeatureBinderRepository repo) {
+                    return new ImsServiceControllerStaticCompat(context, componentName, callbacks,repo);
+                }
+            };
+
     private ImsDynamicQueryManagerFactory mDynamicQueryManagerFactory =
             ImsServiceFeatureQueryManager::new;
 
@@ -432,6 +449,7 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
     // ImsServiceController callbacks.
     private final Object mBoundServicesLock = new Object();
     private int mNumSlots;
+    private final boolean mIsDynamicBinding = SystemProperties.getBoolean("ro.ims.dynamic_bind",true);
     // Array index corresponds to slot, per slot there is a feature->package name mapping.
     // should only be accessed from handler
     private final SparseArray<Map<Integer, String>> mCarrierServices;
@@ -578,18 +596,25 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
     // not locked, only accessed on a handler thread.
     // Active ImsServiceControllers, which are bound to ImsServices.
     private final Map<ComponentName, ImsServiceController> mActiveControllers = new HashMap<>();
+    // Only used as the Component name for legacy ImsServices that did not use dynamic binding.
+    private final ComponentName mStaticComponent;
     private ImsServiceFeatureQueryManager mFeatureQueryManager;
     private final SparseIntArray mSlotIdToSubIdMap;
 
     public ImsResolver(Context context, String defaultMmTelPackageName,
             String defaultRcsPackageName, int numSlots, ImsFeatureBinderRepository repo,
             Looper looper) {
-        Log.i(TAG, "device MMTEL package: " + defaultMmTelPackageName + ", device RCS package:"
-                + defaultRcsPackageName);
         mContext = context;
         mNumSlots = numSlots;
         mRepo = repo;
         mReceiverContext = context.createContextAsUser(UserHandle.ALL, 0 /*flags*/);
+        mStaticComponent = new ComponentName(mContext, ImsResolver.class);
+
+	if(!mIsDynamicBinding)
+		defaultMmTelPackageName = mStaticComponent.getPackageName();
+
+        Log.i(TAG, "device MMTEL package: " + defaultMmTelPackageName + ", device RCS package:"
+                + defaultRcsPackageName);
 
         mHandler = new ResolverHandler(looper);
         mRunnableExecutor = new HandlerExecutor(mHandler);
@@ -643,26 +668,32 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
         mFeatureQueryManager = mDynamicQueryManagerFactory.create(mContext, mDynamicQueryListener);
 
         updateInstalledServicesCache();
+        
+	if(mIsDynamicBinding) {
+		IntentFilter appChangedFilter = new IntentFilter();
+        	appChangedFilter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        	appChangedFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        	appChangedFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        	appChangedFilter.addDataScheme("package");
+        	mReceiverContext.registerReceiver(mAppChangedReceiver, appChangedFilter);
+        	 mReceiverContext.registerReceiver(mConfigChangedReceiver, new IntentFilter(
+        	        CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED));
 
-        IntentFilter appChangedFilter = new IntentFilter();
-        appChangedFilter.addAction(Intent.ACTION_PACKAGE_CHANGED);
-        appChangedFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
-        appChangedFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
-        appChangedFilter.addDataScheme("package");
-        mReceiverContext.registerReceiver(mAppChangedReceiver, appChangedFilter);
-        mReceiverContext.registerReceiver(mConfigChangedReceiver, new IntentFilter(
-                CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED));
+        	UserManager userManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
+        	if (userManager.isUserUnlocked()) {
+        	    mHandler.obtainMessage(HANDLER_BOOT_COMPLETE, null).sendToTarget();
+        	} else {
+        	    mReceiverContext.registerReceiver(mBootCompleted, new IntentFilter(
+        	            Intent.ACTION_BOOT_COMPLETED));
+        	    if (userManager.isUserUnlocked()) {
+        	        mHandler.obtainMessage(HANDLER_BOOT_COMPLETE, null).sendToTarget();
+        	    }
+        	}
+	}
 
-        UserManager userManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
-        if (userManager.isUserUnlocked()) {
-            mHandler.obtainMessage(HANDLER_BOOT_COMPLETE, null).sendToTarget();
-        } else {
-            mReceiverContext.registerReceiver(mBootCompleted, new IntentFilter(
-                    Intent.ACTION_BOOT_COMPLETED));
-            if (userManager.isUserUnlocked()) {
-                mHandler.obtainMessage(HANDLER_BOOT_COMPLETE, null).sendToTarget();
-            }
-        }
+	else
+        	mHandler.obtainMessage(HANDLER_ADD_PACKAGE, mStaticComponent.getPackageName()).sendToTarget();
+
 
         // Update the package names of the carrier ImsServices if they do not exist already and
         // possibly bind if carrier configs exist. Otherwise wait for CarrierConfigChanged
@@ -1707,14 +1738,30 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
         }
     }
 
-    // Return the ImsServiceInfo specified for the package name. If the package name is null,
-    // get all packages that support ImsServices.
     private List<ImsServiceInfo> getImsServiceInfo(String packageName) {
         List<ImsServiceInfo> infos = new ArrayList<>();
-        // Search for Current ImsService implementations
-        infos.addAll(searchForImsServices(packageName, mImsServiceControllerFactory));
-        // Search for compat ImsService Implementations
-        infos.addAll(searchForImsServices(packageName, mImsServiceControllerFactoryCompat));
+        if (!mIsDynamicBinding) {
+            // always return the same ImsService info.
+            infos.addAll(getStaticImsService());
+        } else {
+            // Search for Current ImsService implementations
+            infos.addAll(searchForImsServices(packageName, mImsServiceControllerFactory));
+            // Search for compat ImsService Implementations
+            infos.addAll(searchForImsServices(packageName, mImsServiceControllerFactoryCompat));
+        }
+        return infos;
+    }
+
+
+    private List<ImsServiceInfo> getStaticImsService() {
+        List<ImsServiceInfo> infos = new ArrayList<>();
+
+        ImsServiceInfo info = new ImsServiceInfo();
+        info.name = mStaticComponent;
+        info.controllerFactory = mImsServiceControllerFactoryStaticBindingCompat;
+        info.addFeatureForAllSlots(mNumSlots,ImsFeature.FEATURE_EMERGENCY_MMTEL);
+        info.addFeatureForAllSlots(mNumSlots,ImsFeature.FEATURE_MMTEL);
+        infos.add(info);
         return infos;
     }
 

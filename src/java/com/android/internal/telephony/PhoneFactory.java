@@ -16,6 +16,7 @@
 
 package com.android.internal.telephony;
 
+import android.util.Log;
 import static com.android.internal.telephony.PhoneConstants.PHONE_TYPE_CDMA;
 import static com.android.internal.telephony.PhoneConstants.PHONE_TYPE_CDMA_LTE;
 
@@ -46,6 +47,7 @@ import com.android.internal.telephony.data.PhoneSwitcher;
 import com.android.internal.telephony.data.TelephonyNetworkFactory;
 import com.android.internal.telephony.euicc.EuiccCardController;
 import com.android.internal.telephony.euicc.EuiccController;
+import com.android.internal.telephony.ims.ImsResolver;
 import com.android.internal.telephony.imsphone.ImsPhone;
 import com.android.internal.telephony.imsphone.ImsPhoneFactory;
 import com.android.internal.telephony.metrics.MetricsCollector;
@@ -246,7 +248,7 @@ public class PhoneFactory {
                     // Default phone must be ready before ImsPhone is created because ImsService
                     // might need it when it is being opened.
                     for (int i = 0; i < numPhones; i++) {
-                        sPhones[i].createImsPhone();
+                        sPhones[i].startMonitoringImsService();
                     }
                 } else {
                     Rlog.i(LOG_TAG, "IMS is not supported on this device, skipping ImsResolver.");
@@ -305,7 +307,7 @@ public class PhoneFactory {
                 sPhones[i] = createPhone(context, i);
                 if (context.getPackageManager().hasSystemFeature(
                         PackageManager.FEATURE_TELEPHONY_IMS)) {
-                    sPhones[i].createImsPhone();
+                    sPhones[i].startMonitoringImsService();
                 }
                 sTelephonyNetworkFactories[i] = new TelephonyNetworkFactory(
                         Looper.myLooper(), sPhones[i]);
